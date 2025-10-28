@@ -72,7 +72,7 @@ numpy>=1.21.0
 
 ```bash
 # Process a video with default settings
-python pose_estimation.py input_video.mp4
+python pose-estimation.py input_video.mp4
 ```
 
 This will generate:
@@ -119,7 +119,7 @@ Left Knee           | Mean:  168.5° | Min:  120.3° | Max:  179.8° | Std:   12
 ### Command Line Arguments
 
 ```bash
-python pose_estimation.py <video_path> [options]
+python pose-estimation.py <video_path> [options]
 ```
 
 #### Required Arguments
@@ -140,19 +140,19 @@ python pose_estimation.py <video_path> [options]
 
 ```bash
 # High quality (process every frame, slow)
-python pose_estimation.py video.mp4 --fps-decimation 1
+python pose-estimation.py video.mp4 --fps-decimation 1
 
 # Balanced (default, ~10 FPS for 30fps video)
-python pose_estimation.py video.mp4 --fps-decimation 3
+python pose-estimation.py video.mp4 --fps-decimation 3
 
 # Fast processing (~5 FPS for 30fps video)
-python pose_estimation.py video.mp4 --fps-decimation 6
+python pose-estimation.py video.mp4 --fps-decimation 6
 ```
 
 #### Custom output paths:
 
 ```bash
-python pose_estimation.py athlete_match.mp4 \
+python pose-estimation.py athlete_match.mp4 \
     --output-video analysis/match_skeleton.mp4 \
     --output-json analysis/match_data.json \
     --fps-decimation 3
@@ -163,7 +163,7 @@ python pose_estimation.py athlete_match.mp4 \
 ```bash
 # Bash script for batch processing
 for video in videos/*.mp4; do
-    python pose_estimation.py "$video" --fps-decimation 3
+    python pose-estimation.py "$video" --fps-decimation 3
 done
 ```
 
@@ -310,14 +310,14 @@ MediaPipe provides **33 landmarks** per frame:
 
 #### Real-time Analysis (Fastest)
 ```bash
-python pose_estimation.py video.mp4 --fps-decimation 10
+python pose-estimation.py video.mp4 --fps-decimation 10
 # Processes ~3 FPS for 30fps video
 # Processing time: ~0.5x video length
 ```
 
 #### Biomechanical Analysis (Balanced)
 ```bash
-python pose_estimation.py video.mp4 --fps-decimation 3
+python pose-estimation.py video.mp4 --fps-decimation 3
 # Processes ~10 FPS for 30fps video
 # Processing time: ~1.5x video length
 # ✅ Recommended for sports analysis
@@ -325,7 +325,7 @@ python pose_estimation.py video.mp4 --fps-decimation 3
 
 #### High-Precision Research (Slowest)
 ```bash
-python pose_estimation.py video.mp4 --fps-decimation 1
+python pose-estimation.py video.mp4 --fps-decimation 1
 # Processes all frames
 # Processing time: ~3-5x video length
 ```
