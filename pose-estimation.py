@@ -1,6 +1,6 @@
 """
-3D Pose Estimation with MediaPipe
-Extracts 3D skeleton and calculates joint angles from video input
+Enhanced 3D Pose Estimation with MediaPipe
+Extracts 3D skeleton and calculates joint angles using rotation matrices
 """
 
 import cv2
@@ -9,6 +9,62 @@ import numpy as np
 import json
 from pathlib import Path
 import argparse
+from scipy.signal import medfilt
+
+
+class RotationUtils:
+    """Utility functions for rotation matrix operations"""
+    
+    @staticmethod
+    def get_R_z(theta):
+        """Rotation matrix around Z axis"""
+        return np.array([[np.cos(theta), -np.sin(theta), 0],
+                        [np.sin(theta), np.cos(theta), 0],
+                        [0, 0, 1]])
+    
+    @staticmethod
+    def get_R_x(theta):
+        """Rotation matrix around X axis"""
+        return np.array([[1, 0, 0],
+                        [0, np.cos(theta), -np.sin(theta)],
+                        [0, np.sin(theta), np.cos(theta)]])
+    
+    @staticmethod
+    def get_R_y(theta):
+        """Rotation matrix around Y axis"""
+        return np.array([[np.cos(theta), 0, np.sin(theta)],
+                        [0, 1, 0],
+                        [-np.sin(theta), 0, np.cos(theta)]])
+    
+    @staticmethod
+    def decompose_R_ZXY(R):
+        """Decompose rotation matrix into ZXY Euler angles"""
+        thetax = np.arcsin(R[2, 1])
+        thetaz = np.arctan2(-R[0, 1], R[1, 1])
+        thetay = np.arctan2(-R[2, 0], R[2, 2])
+        return thetaz, thetay, thetax
+    
+    @staticmethod
+    def get_R2(u, v):
+        """Calculate rotation matrix that rotates unit vector u to v"""
+        u = u / np.linalg.norm(u)
+        v = v / np.linalg.norm(v)
+        
+        w = np.cross(u, v)
+        w_norm = np.linalg.norm(w)
+        
+        if w_norm < 1e-6:
+            return np.eye(3)
+        
+        w = w / w_norm
+        theta = np.arccos(np.clip(np.dot(u, v), -1.0, 1.0))
+        
+        K = np.array([[0, -w[2], w[1]],
+                     [w[2], 0, -w[0]],
+                     [-w[1], w[0], 0]])
+        
+        R = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+        return R
 
 
 class PoseEstimator3D:
@@ -18,132 +74,229 @@ class PoseEstimator3D:
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
         
-        # Initialize pose detector with 3D world landmarks
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=2,  # 0=Lite, 1=Full, 2=Heavy (most accurate)
+            model_complexity=2,
             smooth_landmarks=True,
             enable_segmentation=False,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
         
+        self.utils = RotationUtils()
         self.results_data = []
+        self.skeleton_data = None
         
-    def calculate_angle_3d(self, a, b, c):
-        """
-        Calculate 3D angle at point b given three 3D points a, b, c
-        Uses dot product method for accurate 3D angle calculation
+        # MediaPipe to standard joint mapping
+        self.mp_to_standard = {
+            'left_hip': 23,
+            'right_hip': 24,
+            'left_knee': 25,
+            'right_knee': 26,
+            'left_ankle': 27,
+            'right_ankle': 28,
+            'left_shoulder': 11,
+            'right_shoulder': 12,
+            'left_elbow': 13,
+            'right_elbow': 14,
+            'left_wrist': 15,
+            'right_wrist': 16,
+        }
         
-        Args:
-            a, b, c: Points with x, y, z coordinates
-        Returns:
-            Angle in degrees
-        """
-        # Create vectors
-        ba = np.array([a.x - b.x, a.y - b.y, a.z - b.z])
-        bc = np.array([c.x - b.x, c.y - b.y, c.z - b.z])
+        # Define skeleton hierarchy (child: [parent, grandparent, ...])
+        self.hierarchy = {
+            'hips': [],
+            'left_hip': ['hips'],
+            'left_knee': ['left_hip', 'hips'],
+            'left_ankle': ['left_knee', 'left_hip', 'hips'],
+            'right_hip': ['hips'],
+            'right_knee': ['right_hip', 'hips'],
+            'right_ankle': ['right_knee', 'right_hip', 'hips'],
+            'neck': ['hips'],
+            'left_shoulder': ['neck', 'hips'],
+            'left_elbow': ['left_shoulder', 'neck', 'hips'],
+            'left_wrist': ['left_elbow', 'left_shoulder', 'neck', 'hips'],
+            'right_shoulder': ['neck', 'hips'],
+            'right_elbow': ['right_shoulder', 'neck', 'hips'],
+            'right_wrist': ['right_elbow', 'right_shoulder', 'neck', 'hips']
+        }
         
-        # Calculate angle using dot product
-        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-        
-        return np.degrees(angle)
+        self.joints = list(self.hierarchy.keys())
     
-    def calculate_joint_angles(self, landmarks):
-        """
-        Calculate key joint angles from 3D world landmarks
+    def extract_keypoints(self, landmarks):
+        """Extract keypoints from MediaPipe landmarks"""
+        kpts = {}
         
-        MediaPipe Pose Landmark indices:
-        0: nose, 11: left_shoulder, 12: right_shoulder
-        13: left_elbow, 14: right_elbow, 15: left_wrist, 16: right_wrist
-        23: left_hip, 24: right_hip, 25: left_knee, 26: right_knee
-        27: left_ankle, 28: right_ankle
-        """
-        angles = {}
+        for joint, idx in self.mp_to_standard.items():
+            lm = landmarks[idx]
+            kpts[joint] = np.array([lm.x, lm.y, lm.z])
         
-        try:
-            # Right elbow angle (shoulder -> elbow -> wrist)
-            if all(landmarks[i] for i in [12, 14, 16]):
-                angles['right_elbow'] = self.calculate_angle_3d(
-                    landmarks[12], landmarks[14], landmarks[16]
-                )
-            
-            # Left elbow angle
-            if all(landmarks[i] for i in [11, 13, 15]):
-                angles['left_elbow'] = self.calculate_angle_3d(
-                    landmarks[11], landmarks[13], landmarks[15]
-                )
-            
-            # Right shoulder angle (elbow -> shoulder -> hip)
-            if all(landmarks[i] for i in [14, 12, 24]):
-                angles['right_shoulder'] = self.calculate_angle_3d(
-                    landmarks[14], landmarks[12], landmarks[24]
-                )
-            
-            # Left shoulder angle
-            if all(landmarks[i] for i in [13, 11, 23]):
-                angles['left_shoulder'] = self.calculate_angle_3d(
-                    landmarks[13], landmarks[11], landmarks[23]
-                )
-            
-            # Right knee angle (hip -> knee -> ankle)
-            if all(landmarks[i] for i in [24, 26, 28]):
-                angles['right_knee'] = self.calculate_angle_3d(
-                    landmarks[24], landmarks[26], landmarks[28]
-                )
-            
-            # Left knee angle
-            if all(landmarks[i] for i in [23, 25, 27]):
-                angles['left_knee'] = self.calculate_angle_3d(
-                    landmarks[23], landmarks[25], landmarks[27]
-                )
-            
-            # Right hip angle (shoulder -> hip -> knee)
-            if all(landmarks[i] for i in [12, 24, 26]):
-                angles['right_hip'] = self.calculate_angle_3d(
-                    landmarks[12], landmarks[24], landmarks[26]
-                )
-            
-            # Left hip angle
-            if all(landmarks[i] for i in [11, 23, 25]):
-                angles['left_hip'] = self.calculate_angle_3d(
-                    landmarks[11], landmarks[23], landmarks[25]
-                )
-            
-            # Torso angle (shoulder midpoint -> hip midpoint -> vertical)
-            if all(landmarks[i] for i in [11, 12, 23, 24]):
-                # Calculate midpoints
-                shoulder_mid_x = (landmarks[11].x + landmarks[12].x) / 2
-                shoulder_mid_y = (landmarks[11].y + landmarks[12].y) / 2
-                shoulder_mid_z = (landmarks[11].z + landmarks[12].z) / 2
-                
-                hip_mid_x = (landmarks[23].x + landmarks[24].x) / 2
-                hip_mid_y = (landmarks[23].y + landmarks[24].y) / 2
-                hip_mid_z = (landmarks[23].z + landmarks[24].z) / 2
-                
-                # Create mock points for angle calculation
-                class Point:
-                    def __init__(self, x, y, z):
-                        self.x, self.y, self.z = x, y, z
-                
-                shoulder_point = Point(shoulder_mid_x, shoulder_mid_y, shoulder_mid_z)
-                hip_point = Point(hip_mid_x, hip_mid_y, hip_mid_z)
-                vertical_point = Point(hip_mid_x, hip_mid_y + 1, hip_mid_z)
-                
-                angles['torso_lean'] = self.calculate_angle_3d(
-                    shoulder_point, hip_point, vertical_point
-                )
+        # Add computed joints
+        kpts['hips'] = (kpts['left_hip'] + kpts['right_hip']) / 2
+        kpts['neck'] = (kpts['left_shoulder'] + kpts['right_shoulder']) / 2
         
-        except Exception as e:
-            print(f"Error calculating angles: {e}")
+        return kpts
+    
+    def get_bone_lengths(self, all_keypoints):
+        """Calculate average bone lengths across all frames"""
+        bone_lengths = {joint: [] for joint in self.joints if joint != 'hips'}
         
-        return angles
+        for frame_kpts in all_keypoints:
+            for joint in self.joints:
+                if joint == 'hips':
+                    continue
+                parent = self.hierarchy[joint][0]
+                bone_vec = frame_kpts[joint] - frame_kpts[parent]
+                length = np.linalg.norm(bone_vec)
+                bone_lengths[joint].append(length)
+        
+        # Take median length for each bone
+        avg_bone_lengths = {}
+        for joint, lengths in bone_lengths.items():
+            avg_bone_lengths[joint] = np.median(lengths)
+        
+        return avg_bone_lengths
+    
+    def get_base_skeleton(self, bone_lengths, normalization_bone='neck'):
+        """Define T-pose skeleton with normalized bone lengths"""
+        normalization = bone_lengths[normalization_bone]
+        
+        # Define offset directions for T-pose
+        offset_directions = {
+            'left_hip': np.array([1, 0, 0]),
+            'left_knee': np.array([0, -1, 0]),
+            'left_ankle': np.array([0, -1, 0]),
+            'right_hip': np.array([-1, 0, 0]),
+            'right_knee': np.array([0, -1, 0]),
+            'right_ankle': np.array([0, -1, 0]),
+            'neck': np.array([0, 1, 0]),
+            'left_shoulder': np.array([1, 0, 0]),
+            'left_elbow': np.array([1, 0, 0]),
+            'left_wrist': np.array([1, 0, 0]),
+            'right_shoulder': np.array([-1, 0, 0]),
+            'right_elbow': np.array([-1, 0, 0]),
+            'right_wrist': np.array([-1, 0, 0])
+        }
+        
+        base_skeleton = {'hips': np.array([0, 0, 0])}
+        
+        # Average symmetric limbs
+        def set_length(joint_type):
+            left_len = bone_lengths[f'left_{joint_type}']
+            right_len = bone_lengths[f'right_{joint_type}']
+            avg_len = (left_len + right_len) / (2 * normalization)
+            
+            base_skeleton[f'left_{joint_type}'] = offset_directions[f'left_{joint_type}'] * avg_len
+            base_skeleton[f'right_{joint_type}'] = offset_directions[f'right_{joint_type}'] * avg_len
+        
+        set_length('hip')
+        set_length('knee')
+        set_length('ankle')
+        set_length('shoulder')
+        set_length('elbow')
+        set_length('wrist')
+        
+        base_skeleton['neck'] = offset_directions['neck'] * (bone_lengths['neck'] / normalization)
+        
+        return base_skeleton, offset_directions, normalization
+    
+    def get_hips_position_and_rotation(self, frame_kpts):
+        """Calculate root (hips) position and rotation"""
+        root_pos = frame_kpts['hips']
+        
+        # Calculate root coordinate system
+        root_u = frame_kpts['left_hip'] - frame_kpts['hips']
+        root_u = root_u / np.linalg.norm(root_u)
+        
+        root_v = frame_kpts['neck'] - frame_kpts['hips']
+        root_v = root_v / np.linalg.norm(root_v)
+        
+        root_w = np.cross(root_u, root_v)
+        root_w = root_w / np.linalg.norm(root_w)
+        
+        # Rotation matrix
+        C = np.column_stack([root_u, root_v, root_w])
+        tz, ty, tx = self.utils.decompose_R_ZXY(C)
+        root_rotation = np.array([tz, tx, ty])
+        
+        return root_pos, root_rotation
+    
+    def get_rotation_chain(self, joint, hierarchy, frame_rotations):
+        """Compose chain of rotation matrices"""
+        hierarchy = hierarchy[::-1]
+        R = np.eye(3)
+        
+        for parent in hierarchy:
+            angles = frame_rotations[parent]
+            _R = (self.utils.get_R_z(angles[0]) @ 
+                  self.utils.get_R_x(angles[1]) @ 
+                  self.utils.get_R_y(angles[2]))
+            R = R @ _R
+        
+        return R
+    
+    def get_joint_rotation(self, joint_name, frame_kpts, frame_rotations, offset_directions):
+        """Calculate rotation for a specific joint"""
+        hierarchy = self.hierarchy[joint_name]
+        
+        # Calculate inverse rotation from parent chain
+        invR = np.eye(3)
+        for i, parent in enumerate(hierarchy):
+            if i == 0:
+                continue
+            angles = frame_rotations[parent]
+            R = (self.utils.get_R_z(angles[0]) @ 
+                 self.utils.get_R_x(angles[1]) @ 
+                 self.utils.get_R_y(angles[2]))
+            invR = invR @ R.T
+        
+        # Calculate bone vector in local space
+        parent = hierarchy[0]
+        b = invR @ (frame_kpts[joint_name] - frame_kpts[parent])
+        
+        # Calculate rotation to align offset direction with bone vector
+        R = self.utils.get_R2(offset_directions[joint_name], b)
+        tz, ty, tx = self.utils.decompose_R_ZXY(R)
+        
+        return np.array([tz, tx, ty])
+    
+    def calculate_joint_angles(self, frame_kpts, offset_directions):
+        """Calculate all joint angles for a single frame"""
+        # Get root rotation
+        root_pos, root_rotation = self.get_hips_position_and_rotation(frame_kpts)
+        frame_rotations = {'hips': root_rotation}
+        
+        # Center pose at hips
+        centered_kpts = {}
+        for joint in self.joints:
+            centered_kpts[joint] = frame_kpts[joint] - root_pos
+        
+        # Calculate joint rotations by hierarchy depth
+        max_depth = max(len(self.hierarchy[j]) for j in self.joints)
+        
+        for depth in range(2, max_depth + 1):
+            for joint in self.joints:
+                if len(self.hierarchy[joint]) == depth:
+                    joint_rotation = self.get_joint_rotation(
+                        joint, centered_kpts, frame_rotations, offset_directions
+                    )
+                    parent = self.hierarchy[joint][0]
+                    frame_rotations[parent] = joint_rotation
+        
+        # Add zero rotation for endpoints
+        for joint in self.joints:
+            if joint not in frame_rotations:
+                frame_rotations[joint] = np.array([0., 0., 0.])
+        
+        return frame_rotations, root_pos
+    
+    def angles_to_degrees(self, angles_dict):
+        """Convert angles from radians to degrees"""
+        return {k: np.degrees(v) for k, v in angles_dict.items()}
     
     def draw_pose_on_frame(self, frame, results):
-        """Draw pose landmarks and connections on frame"""
+        """Draw pose landmarks on frame"""
         if results.pose_landmarks:
-            # Draw pose landmarks
             self.mp_drawing.draw_landmarks(
                 frame,
                 results.pose_landmarks,
@@ -153,14 +306,7 @@ class PoseEstimator3D:
         return frame
     
     def process_video(self, video_path, output_path=None, fps_decimation=3):
-        """
-        Process video and extract 3D pose with joint angles
-        
-        Args:
-            video_path: Path to input video
-            output_path: Path to save output video (optional)
-            fps_decimation: Process every Nth frame (default 3 = ~10 FPS for 30fps video)
-        """
+        """Process video and extract 3D pose with joint angles"""
         cap = cv2.VideoCapture(str(video_path))
         
         if not cap.isOpened():
@@ -178,7 +324,7 @@ class PoseEstimator3D:
         print(f"   Total Frames: {total_frames}")
         print(f"   Processing every {fps_decimation} frames (~{fps//fps_decimation} FPS)")
         
-        # Setup video writer if output path provided
+        # Setup video writer
         out = None
         if output_path:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -186,9 +332,60 @@ class PoseEstimator3D:
         
         frame_count = 0
         processed_count = 0
-        self.results_data = []
+        all_keypoints = []
         
-        print("\n🔄 Processing video...")
+        print("\n🔄 Phase 1: Extracting keypoints...")
+        
+        # First pass: extract all keypoints
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                break
+            
+            frame_count += 1
+            
+            if frame_count % fps_decimation != 0:
+                continue
+            
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image.flags.writeable = False
+            results = self.pose.process(image)
+            
+            if results.pose_world_landmarks:
+                kpts = self.extract_keypoints(results.pose_world_landmarks.landmark)
+                all_keypoints.append(kpts)
+                processed_count += 1
+            
+            if processed_count % 10 == 0:
+                progress = (frame_count / total_frames) * 100
+                print(f"   Progress: {progress:.1f}% ({processed_count} frames)", end='\r')
+        
+        print(f"\n   Extracted {len(all_keypoints)} frames with keypoints")
+        
+        if len(all_keypoints) == 0:
+            print("❌ No pose detected in video")
+            cap.release()
+            return []
+        
+        # Calculate skeleton parameters
+        print("\n🔄 Phase 2: Calculating skeleton structure...")
+        bone_lengths = self.get_bone_lengths(all_keypoints)
+        base_skeleton, offset_directions, normalization = self.get_base_skeleton(bone_lengths)
+        
+        self.skeleton_data = {
+            'bone_lengths': bone_lengths,
+            'base_skeleton': base_skeleton,
+            'offset_directions': offset_directions,
+            'normalization': normalization,
+            'hierarchy': self.hierarchy
+        }
+        
+        # Second pass: calculate angles and create output video
+        print("\n🔄 Phase 3: Calculating joint angles and creating output...")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_count = 0
+        processed_count = 0
+        self.results_data = []
         
         while cap.isOpened():
             success, frame = cap.read()
@@ -197,84 +394,82 @@ class PoseEstimator3D:
             
             frame_count += 1
             
-            # Process only every Nth frame (temporal decimation)
             if frame_count % fps_decimation != 0:
                 continue
             
-            # Convert BGR to RGB for MediaPipe
+            if processed_count >= len(all_keypoints):
+                break
+            
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image.flags.writeable = False
-            
-            # Process pose detection
             results = self.pose.process(image)
-            
-            # Convert back to BGR for OpenCV
             image.flags.writeable = True
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
             
-            # Extract data if pose detected
             if results.pose_world_landmarks:
-                # Calculate joint angles from 3D world landmarks
-                angles = self.calculate_joint_angles(results.pose_world_landmarks.landmark)
+                kpts = all_keypoints[processed_count]
+                
+                # Calculate joint angles
+                joint_rotations, root_pos = self.calculate_joint_angles(kpts, offset_directions)
+                joint_angles_deg = self.angles_to_degrees(joint_rotations)
                 
                 # Store frame data
                 frame_data = {
                     'frame_number': frame_count,
                     'timestamp': frame_count / fps,
-                    'joint_angles': angles,
-                    'landmarks_3d': []
+                    'root_position': root_pos.tolist(),
+                    'joint_angles_rad': {k: v.tolist() for k, v in joint_rotations.items()},
+                    'joint_angles_deg': {k: v.tolist() for k, v in joint_angles_deg.items()},
+                    'keypoints_3d': {k: v.tolist() for k, v in kpts.items()}
                 }
-                
-                # Store 3D world coordinates
-                for idx, landmark in enumerate(results.pose_world_landmarks.landmark):
-                    frame_data['landmarks_3d'].append({
-                        'id': idx,
-                        'name': self.mp_pose.PoseLandmark(idx).name,
-                        'x': landmark.x,
-                        'y': landmark.y,
-                        'z': landmark.z,
-                        'visibility': landmark.visibility
-                    })
                 
                 self.results_data.append(frame_data)
                 
-                # Draw pose on frame
+                # Draw pose
                 image = self.draw_pose_on_frame(image, results)
                 
-                # Draw angles on frame
+                # Draw key angles
                 y_offset = 30
-                for joint_name, angle in angles.items():
-                    text = f"{joint_name.replace('_', ' ').title()}: {angle:.1f}°"
-                    cv2.putText(image, text, (10, y_offset), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 128), 2)
-                    y_offset += 30
+                key_joints = ['left_elbow', 'right_elbow', 'left_knee', 'right_knee']
+                for joint in key_joints:
+                    if joint in joint_angles_deg:
+                        angles = joint_angles_deg[joint]
+                        text = f"{joint.replace('_', ' ').title()}: [{angles[0]:.1f}°, {angles[1]:.1f}°, {angles[2]:.1f}°]"
+                        cv2.putText(image, text, (10, y_offset), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 2)
+                        y_offset += 25
                 
                 processed_count += 1
             
-            # Write frame to output video
             if out:
                 out.write(image)
             
-            # Display progress
             if processed_count % 10 == 0:
                 progress = (frame_count / total_frames) * 100
-                print(f"   Progress: {progress:.1f}% ({processed_count} frames processed)", end='\r')
+                print(f"   Progress: {progress:.1f}% ({processed_count} frames)", end='\r')
         
-        # Cleanup
         cap.release()
         if out:
             out.release()
         
         print(f"\n✅ Processing complete!")
-        print(f"   Total frames processed: {processed_count}")
-        print(f"   Poses detected: {len(self.results_data)}")
+        print(f"   Poses with angles: {len(self.results_data)}")
         
         return self.results_data
     
     def save_results(self, output_json_path):
         """Save pose data and joint angles to JSON"""
+        output_data = {
+            'skeleton_parameters': {
+                'bone_lengths': {k: float(v) for k, v in self.skeleton_data['bone_lengths'].items()},
+                'normalization': float(self.skeleton_data['normalization']),
+                'hierarchy': self.skeleton_data['hierarchy']
+            },
+            'frames': self.results_data
+        }
+        
         with open(output_json_path, 'w') as f:
-            json.dump(self.results_data, f, indent=2)
+            json.dump(output_data, f, indent=2)
         print(f"\n💾 Results saved to: {output_json_path}")
     
     def print_summary(self):
@@ -283,25 +478,29 @@ class PoseEstimator3D:
             print("No data to summarize")
             return
         
-        print("\n📊 Joint Angle Summary (degrees):")
-        print("-" * 60)
+        print("\n📊 Joint Angle Summary (ZXY Euler angles in degrees):")
+        print("-" * 80)
         
         # Collect all angles
-        all_angles = {}
+        all_angles = {joint: {'z': [], 'x': [], 'y': []} for joint in self.joints}
+        
         for frame in self.results_data:
-            for joint, angle in frame['joint_angles'].items():
-                if joint not in all_angles:
-                    all_angles[joint] = []
-                all_angles[joint].append(angle)
+            for joint, angles in frame['joint_angles_deg'].items():
+                all_angles[joint]['z'].append(angles[0])
+                all_angles[joint]['x'].append(angles[1])
+                all_angles[joint]['y'].append(angles[2])
         
         # Print statistics
-        for joint, angles in sorted(all_angles.items()):
-            angles_array = np.array(angles)
-            print(f"{joint.replace('_', ' ').title():20s} | "
-                  f"Mean: {np.mean(angles_array):6.1f}° | "
-                  f"Min: {np.min(angles_array):6.1f}° | "
-                  f"Max: {np.max(angles_array):6.1f}° | "
-                  f"Std: {np.std(angles_array):6.1f}°")
+        for joint in self.joints:
+            if len(all_angles[joint]['z']) == 0:
+                continue
+            print(f"\n{joint.replace('_', ' ').title()}:")
+            for i, axis in enumerate(['Z', 'X', 'Y']):
+                vals = np.array(all_angles[joint][axis.lower()])
+                print(f"  {axis}-axis: Mean={np.mean(vals):7.1f}° | "
+                      f"Min={np.min(vals):7.1f}° | "
+                      f"Max={np.max(vals):7.1f}° | "
+                      f"Std={np.std(vals):6.1f}°")
     
     def cleanup(self):
         """Release resources"""
@@ -310,12 +509,12 @@ class PoseEstimator3D:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='3D Pose Estimation and Joint Angle Calculator'
+        description='Enhanced 3D Pose Estimation with Biomechanical Joint Angles'
     )
     parser.add_argument('video_path', type=str, help='Path to input video file')
-    parser.add_argument('--output-video', type=str, help='Path to save output video with pose overlay')
+    parser.add_argument('--output-video', type=str, help='Path to save output video')
     parser.add_argument('--output-json', type=str, help='Path to save pose data JSON')
-    parser.add_argument('--fps-decimation', type=int, default=3, 
+    parser.add_argument('--fps-decimation', type=int, default=3,
                        help='Process every Nth frame (default: 3)')
     
     args = parser.parse_args()
@@ -328,11 +527,11 @@ def main():
     
     # Set default output paths
     output_video = args.output_video or f"output_pose_{video_path.stem}.mp4"
-    output_json = args.output_json or f"pose_data_{video_path.stem}.json"
+    output_json = args.output_json or f"pose_angles_{video_path.stem}.json"
     
-    print("=" * 60)
-    print("🎯 3D Pose Estimation with MediaPipe")
-    print("=" * 60)
+    print("=" * 80)
+    print("🎯 Enhanced 3D Pose Estimation with Biomechanical Joint Angles")
+    print("=" * 80)
     
     # Initialize and process
     estimator = PoseEstimator3D()
@@ -345,14 +544,15 @@ def main():
             fps_decimation=args.fps_decimation
         )
         
-        # Save results
-        estimator.save_results(output_json)
-        
-        # Print summary
-        estimator.print_summary()
-        
-        print(f"\n🎬 Output video: {output_video}")
-        print(f"📄 Output JSON: {output_json}")
+        if results:
+            # Save results
+            estimator.save_results(output_json)
+            
+            # Print summary
+            estimator.print_summary()
+            
+            print(f"\n🎬 Output video: {output_video}")
+            print(f"📄 Output JSON: {output_json}")
         
     except Exception as e:
         print(f"\n❌ Error: {e}")
